@@ -1,6 +1,6 @@
 use crate::error::StudentIntroError;
 use crate::instruction::IntroInstruction;
-use crate::state::StudentInfo;
+use crate::state::{ReplyCounter, ReplyInfo, StudentInfo};
 use borsh::BorshSerialize;
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
@@ -14,6 +14,7 @@ use solana_program::{
     system_instruction,
     sysvar::{rent::Rent, Sysvar},
 };
+use std::borrow::BorrowMut;
 use std::convert::TryInto;
 
 pub fn process_instruction(
@@ -29,6 +30,7 @@ pub fn process_instruction(
         IntroInstruction::UpdateStudentIntro { name, message } => {
             update_student_intro(program_id, accounts, name, message)
         }
+        IntroInstruction::Reply { reply } => add_reply(program_id, accounts, reply),
     }
 }
 
@@ -92,6 +94,7 @@ pub fn add_student_intro(
         return Err(ProgramError::AccountAlreadyInitialized);
     }
 
+    account_data.discriminator = StudentInfo::DISCRIMINATOR.to_string();
     account_data.name = name;
     account_data.msg = message;
     account_data.is_initialized = true;
@@ -136,17 +139,97 @@ pub fn update_student_intro(
         msg!("Invalid seeds for PDA");
         return Err(StudentIntroError::InvalidPDA.into());
     }
+    
     let update_len: usize = 1 + (4 + account_data.name.len()) + (4 + message.len());
     if update_len > 1000 {
         msg!("Data length is larger than 1000 bytes");
         return Err(StudentIntroError::InvalidDataLength.into());
     }
 
+    // should already have the right discriminator
+    // account_data.discriminator = StudentInfo::DISCRIMINATOR.to_string();
     account_data.name = account_data.name;
     account_data.msg = message;
     msg!("serializing account");
     account_data.serialize(&mut &mut user_account.data.borrow_mut()[..])?;
     msg!("state account serialized");
+
+    Ok(())
+}
+
+pub fn add_reply(program_id: &Pubkey, accounts: &[AccountInfo], reply: String) -> ProgramResult {
+    msg!("Adding reply to student intro...");
+    msg!("Reply: {}", reply);
+    let account_info_iter = &mut accounts.iter();
+
+    let replier = next_account_info(account_info_iter)?;
+    let pda_student: &AccountInfo = next_account_info(account_info_iter)?;
+    let pda_counter: &AccountInfo = next_account_info(account_info_iter)?;
+    let pda_reply: &AccountInfo = next_account_info(account_info_iter)?;
+    let system_program: &AccountInfo = next_account_info(account_info_iter)?;
+
+    if pda_counter.owner != system_program.key {
+        msg!("Invalid owner for counter PDA");
+        return Err(ProgramError::IllegalOwner);
+    }
+
+    let counter_data =
+        try_from_slice_unchecked::<ReplyCounter>(&pda_counter.data.borrow()).unwrap();
+
+    let account_len: usize = ReplyInfo::get_account_size(reply);
+
+    let rent = Rent::get()?;
+    let account_lamports = rent.minimum_balance(account_len);
+
+    let (reply_pda, reply_bump_seed) = Pubkey::find_program_address(
+        &[
+            pda_student.key.as_ref(),
+            counter_data.count.to_be_bytes().as_ref(),
+        ],
+        program_id,
+    );
+    if reply_pda != *pda_reply.key {
+        msg!("Passed in PDA does not match computed PDA");
+        return Err(StudentIntroError::InvalidPDA.into());
+    }
+
+    invoke_signed(
+        &system_instruction::create_account(
+            replier.key,
+            pda_reply.key,
+            account_lamports,
+            account_len.try_into().unwrap(),
+            program_id,
+        ),
+        &[replier.clone(), pda_reply.clone(), system_program.clone()],
+        &[&[
+            pda_student.key.as_ref(),
+            counter_data.count.to_be_bytes().as_ref(),
+            &[reply_bump_seed],
+        ]],
+    )?;
+
+    msg!("Created reply account");
+
+    let mut reply_data: ReplyInfo =
+        try_from_slice_unchecked::<ReplyInfo>(&pda_reply.data.borrow()).unwrap();
+
+    msg!("Checking if reply is alreayd initialized");
+    if reply_data.is_initialized {
+        msg!("Reply alreayd initialized");
+        return Err(ProgramError::AccountAlreadyInitialized);
+    }
+
+    reply_data.discriminator = ReplyInfo::DISCRIMINATOR.to_string();
+    reply_data.reply = reply;
+    reply_data.student_info = *pda_student.key;
+    reply_data.is_initialized = true;
+    reply_data.serialize(&mut &mut pda_reply.data.borrow_mut()[..])?;
+
+    msg!("Reply Count: {}", counter_data.count);
+    counter_data.discriminator = ReplyCounter::DISCRIMINATOR.to_string();
+    counter_data.count += 1;
+    counter_data.serialize(&mut &mut pda_counter.data.borrow_mut()[..])?;
 
     Ok(())
 }
