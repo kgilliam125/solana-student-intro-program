@@ -14,7 +14,6 @@ use solana_program::{
     system_instruction,
     sysvar::{rent::Rent, Sysvar},
 };
-use std::borrow::BorrowMut;
 use std::convert::TryInto;
 
 pub fn process_instruction(
@@ -47,6 +46,7 @@ pub fn add_student_intro(
 
     let initializer = next_account_info(account_info_iter)?;
     let user_account = next_account_info(account_info_iter)?;
+    let pda_counter: &AccountInfo = next_account_info(account_info_iter)?;
     let system_program = next_account_info(account_info_iter)?;
 
     let (pda, bump_seed) = Pubkey::find_program_address(&[initializer.key.as_ref()], program_id);
@@ -102,6 +102,49 @@ pub fn add_student_intro(
     account_data.serialize(&mut &mut user_account.data.borrow_mut()[..])?;
     msg!("state account serialized");
 
+    let counter_len = ReplyCounter::get_account_size();
+    let rent = Rent::get()?;
+    let counter_rent_lamports = rent.minimum_balance(counter_len);
+
+    let (reply_counter_pda, reply_counter_bump) =
+        Pubkey::find_program_address(&[pda.as_ref(), b"reply"], program_id);
+    if reply_counter_pda != *pda_counter.key {
+        msg!("Invalid counter PDA seeds");
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    invoke_signed(
+        &system_instruction::create_account(
+            initializer.key,
+            pda_counter.key,
+            counter_rent_lamports,
+            counter_len.try_into().unwrap(),
+            program_id,
+        ),
+        &[
+            initializer.clone(),
+            pda_counter.clone(),
+            system_program.clone(),
+        ],
+        &[&[pda.as_ref(), b"reply", &[reply_counter_bump]]],
+    )?;
+
+    let mut counter_data =
+        try_from_slice_unchecked::<ReplyCounter>(&pda_counter.data.borrow()).unwrap();
+
+    msg!("checking if counter account is already initialized");
+    if counter_data.is_initialized() {
+        msg!("Account already initialized");
+        return Err(ProgramError::AccountAlreadyInitialized);
+    }
+
+    counter_data.discriminator = ReplyInfo::DISCRIMINATOR.to_string();
+    counter_data.count = 0;
+    counter_data.is_initialized = true;
+    msg!("reply count: {}", counter_data.count);
+
+    counter_data.serialize(&mut &mut pda_counter.data.borrow_mut()[..])?;
+
     Ok(())
 }
 
@@ -139,7 +182,7 @@ pub fn update_student_intro(
         msg!("Invalid seeds for PDA");
         return Err(StudentIntroError::InvalidPDA.into());
     }
-    
+
     let update_len: usize = 1 + (4 + account_data.name.len()) + (4 + message.len());
     if update_len > 1000 {
         msg!("Data length is larger than 1000 bytes");
@@ -176,7 +219,7 @@ pub fn add_reply(program_id: &Pubkey, accounts: &[AccountInfo], reply: String) -
     let counter_data =
         try_from_slice_unchecked::<ReplyCounter>(&pda_counter.data.borrow()).unwrap();
 
-    let account_len: usize = ReplyInfo::get_account_size(reply);
+    let account_len: usize = ReplyInfo::get_account_size(reply.clone());
 
     let rent = Rent::get()?;
     let account_lamports = rent.minimum_balance(account_len);
@@ -213,12 +256,14 @@ pub fn add_reply(program_id: &Pubkey, accounts: &[AccountInfo], reply: String) -
 
     let mut reply_data: ReplyInfo =
         try_from_slice_unchecked::<ReplyInfo>(&pda_reply.data.borrow()).unwrap();
-
     msg!("Checking if reply is alreayd initialized");
     if reply_data.is_initialized {
         msg!("Reply alreayd initialized");
         return Err(ProgramError::AccountAlreadyInitialized);
     }
+
+    let mut counter_data: ReplyCounter =
+        try_from_slice_unchecked::<ReplyCounter>(&pda_counter.data.borrow()).unwrap();
 
     reply_data.discriminator = ReplyInfo::DISCRIMINATOR.to_string();
     reply_data.reply = reply;
