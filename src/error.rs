@@ -9,6 +9,8 @@ pub enum StudentIntroError {
     InvalidPDA,
     #[error("Input data exceeds max length")]
     InvalidDataLength,
+    #[error("Incorrect account provided")]
+    IncorrectAccountError
 }
 
 impl From<StudentIntroError> for ProgramError {
